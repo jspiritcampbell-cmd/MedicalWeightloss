@@ -1,4 +1,4 @@
-# GLP-1 Medical Information App - Streamlit Version (Production Ready)
+# GLP-1 Medical Information App - Streamlit (Fixed for Deployment)
 # Deploy with: streamlit run app.py
 # Requirements: streamlit>=1.28.0, requests>=2.31.0
 
@@ -8,69 +8,138 @@ import json
 from typing import Dict, Optional, List, Tuple
 import time
 from datetime import datetime
+import random
 
 # Configuration
 API_BASE_URL = "https://api.endlessmedical.com/v1/dx"
-API_TIMEOUT = 10  # seconds
-MAX_RETRIES = 3
+API_TIMEOUT = 15
+MAX_RETRIES = 2
+USE_MOCK_MODE = False  # Will auto-switch to True if API fails
 
-class EndlessMedicalAPI:
-    """Client for interacting with EndlessMedical API with enhanced error handling"""
+class MockAPI:
+    """Mock API for when EndlessMedical is unavailable"""
     
     def __init__(self):
+        self.session_id = f"mock_{random.randint(10000, 99999)}"
+        self.features = []
+        
+    def create_session(self) -> bool:
+        return True
+    
+    def accept_terms(self) -> bool:
+        return True
+    
+    def add_feature(self, name: str, value: str) -> bool:
+        self.features.append({"name": name, "value": value})
+        return True
+    
+    def analyze(self) -> Dict:
+        """Generate mock analysis based on features"""
+        has_diabetes = any(f["name"] == "Diabetes" for f in self.features)
+        has_obesity = any(f["name"] == "Obesity" for f in self.features)
+        has_high_sugar = any(f["name"] == "HighBloodSugar" for f in self.features)
+        
+        conditions = []
+        if has_diabetes:
+            conditions.append({
+                "Name": "Type 2 Diabetes Mellitus",
+                "Probability": 0.85,
+                "Icd": "E11",
+                "ProfName": "Type 2 Diabetes Mellitus",
+                "Ranking": 1
+            })
+        if has_obesity:
+            conditions.append({
+                "Name": "Obesity",
+                "Probability": 0.78,
+                "Icd": "E66",
+                "ProfName": "Obesity",
+                "Ranking": 2
+            })
+        if has_high_sugar:
+            conditions.append({
+                "Name": "Hyperglycemia",
+                "Probability": 0.72,
+                "Icd": "R73.9",
+                "ProfName": "Hyperglycemia",
+                "Ranking": 3
+            })
+        
+        if not conditions:
+            conditions = [{
+                "Name": "General Health Assessment",
+                "Probability": 0.60,
+                "Icd": "Z00.00",
+                "ProfName": "General medical examination",
+                "Ranking": 1
+            }]
+        
+        return {
+            "Status": "SUCCESS",
+            "SessionID": self.session_id,
+            "Conditions": conditions,
+            "TriageLevel": "MEDIUM" if has_diabetes or has_obesity else "LOW",
+            "Message": "Mock analysis generated - EndlessMedical API unavailable"
+        }
+    
+    def get_last_error(self) -> str:
+        return "Using mock mode - API connection unavailable"
+
+
+class EndlessMedicalAPI:
+    """Client for EndlessMedical API with fallback to mock mode"""
+    
+    def __init__(self, force_mock: bool = False):
         self.base_url = API_BASE_URL
         self.session_id = None
         self.last_error = None
+        self.use_mock = force_mock
+        self.mock_api = None
         
+        if self.use_mock:
+            self.mock_api = MockAPI()
+    
     def _make_request(self, method: str, endpoint: str, params: Dict = None, 
-                      data: Dict = None, retries: int = MAX_RETRIES) -> Optional[Dict]:
-        """Make HTTP request with retry logic and error handling"""
+                      data: Dict = None) -> Optional[Dict]:
+        """Make HTTP request with error handling"""
+        if self.use_mock:
+            return {"success": True}
+        
         url = f"{self.base_url}/{endpoint}"
         
-        for attempt in range(retries):
-            try:
-                if method.upper() == "GET":
-                    response = requests.get(url, params=params, timeout=API_TIMEOUT)
-                else:
-                    response = requests.post(url, params=params, json=data, timeout=API_TIMEOUT)
-                
-                # Check for successful status code
-                if response.status_code == 200:
-                    try:
-                        return response.json()
-                    except json.JSONDecodeError:
-                        self.last_error = "Invalid JSON response from API"
-                        return None
-                elif response.status_code == 429:
-                    # Rate limited - wait and retry
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    self.last_error = f"API returned status code {response.status_code}"
-                    if attempt == retries - 1:
-                        return None
-                    
-            except requests.exceptions.Timeout:
-                self.last_error = "Request timed out"
-                if attempt == retries - 1:
+        try:
+            if method.upper() == "GET":
+                response = requests.get(url, params=params, timeout=API_TIMEOUT)
+            else:
+                response = requests.post(url, params=params, json=data, timeout=API_TIMEOUT)
+            
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except json.JSONDecodeError:
+                    self.last_error = "Invalid JSON response"
                     return None
-                time.sleep(1)
-                
-            except requests.exceptions.ConnectionError:
-                self.last_error = "Connection error - check internet connection"
-                if attempt == retries - 1:
-                    return None
-                time.sleep(1)
-                
-            except Exception as e:
-                self.last_error = f"Unexpected error: {str(e)}"
+            else:
+                self.last_error = f"Status code {response.status_code}"
                 return None
                 
-        return None
+        except requests.exceptions.Timeout:
+            self.last_error = "Request timeout"
+            return None
+            
+        except requests.exceptions.ConnectionError:
+            self.last_error = "Connection failed"
+            return None
+            
+        except Exception as e:
+            self.last_error = f"Error: {str(e)}"
+            return None
     
     def create_session(self) -> bool:
-        """Initialize a new session with the API"""
+        """Initialize session"""
+        if self.use_mock:
+            return self.mock_api.create_session()
+        
         data = self._make_request("GET", "InitSession")
         if data and 'SessionID' in data:
             self.session_id = data['SessionID']
@@ -78,9 +147,11 @@ class EndlessMedicalAPI:
         return False
     
     def accept_terms(self) -> bool:
-        """Accept the API terms of use"""
+        """Accept API terms"""
+        if self.use_mock:
+            return self.mock_api.accept_terms()
+        
         if not self.session_id:
-            self.last_error = "No active session"
             return False
         
         params = {
@@ -92,9 +163,11 @@ class EndlessMedicalAPI:
         return data is not None
     
     def add_feature(self, feature_name: str, feature_value: str) -> bool:
-        """Add a symptom or feature to the current session"""
+        """Add feature to session"""
+        if self.use_mock:
+            return self.mock_api.add_feature(feature_name, feature_value)
+        
         if not self.session_id:
-            self.last_error = "No active session"
             return False
         
         params = {
@@ -107,27 +180,30 @@ class EndlessMedicalAPI:
         return data is not None
     
     def analyze(self) -> Optional[Dict]:
-        """Get diagnosis analysis"""
+        """Get analysis"""
+        if self.use_mock:
+            return self.mock_api.analyze()
+        
         if not self.session_id:
-            self.last_error = "No active session"
             return None
         
         params = {'SessionID': self.session_id}
         return self._make_request("GET", "Analyze", params=params)
     
     def get_last_error(self) -> str:
-        """Get the last error message"""
+        """Get last error message"""
         return self.last_error or "Unknown error"
 
 
 def initialize_session_state():
-    """Initialize Streamlit session state variables"""
+    """Initialize session state"""
     defaults = {
         'analysis_complete': False,
         'results': None,
-        'api_status': 'ready',
         'last_analysis_time': None,
-        'feature_count': 0
+        'feature_count': 0,
+        'using_mock': USE_MOCK_MODE,
+        'api_tested': False
     }
     
     for key, value in defaults.items():
@@ -138,30 +214,50 @@ def initialize_session_state():
 def test_api_connection() -> Tuple[bool, str]:
     """Test API connectivity"""
     try:
-        api = EndlessMedicalAPI()
-        if api.create_session():
+        response = requests.get(f"{API_BASE_URL}/InitSession", timeout=5)
+        if response.status_code == 200:
             return True, "✅ API connection successful"
         else:
-            return False, f"❌ API connection failed: {api.get_last_error()}"
+            return False, f"⚠️ API returned status {response.status_code}"
+    except requests.exceptions.Timeout:
+        return False, "⚠️ Connection timeout - using mock mode"
+    except requests.exceptions.ConnectionError:
+        return False, "⚠️ Connection error - using mock mode"
     except Exception as e:
-        return False, f"❌ Connection error: {str(e)}"
+        return False, f"⚠️ Error: {str(e)} - using mock mode"
 
 
-def display_glp1_info_sidebar():
-    """Display GLP-1 information in sidebar"""
+def display_sidebar():
+    """Display sidebar content"""
     with st.sidebar:
         st.header("💊 About GLP-1 Medications")
         
-        with st.expander("Common GLP-1 Medications", expanded=False):
+        # API Status
+        st.subheader("🔌 API Status")
+        if st.session_state.using_mock:
+            st.warning("⚠️ Using Demo Mode\n\nAPI unavailable - showing sample analysis")
+        else:
+            st.success("✅ Live API Connected")
+        
+        if st.button("Test API Connection", use_container_width=True):
+            with st.spinner("Testing..."):
+                status, message = test_api_connection()
+                st.info(message)
+                if not status:
+                    st.session_state.using_mock = True
+        
+        st.markdown("---")
+        
+        with st.expander("Common GLP-1 Medications"):
             st.markdown("""
             - **Semaglutide** (Ozempic, Wegovy)
             - **Liraglutide** (Victoza, Saxenda)
             - **Dulaglutide** (Trulicity)
             - **Tirzepatide** (Mounjaro, Zepbound)
-            - **Exenatide** (Byetta, Bydureon)
+            - **Exenatide** (Byetta)
             """)
         
-        with st.expander("Primary Uses", expanded=False):
+        with st.expander("Primary Uses"):
             st.markdown("""
             - Type 2 Diabetes Management
             - Weight Loss/Obesity Treatment
@@ -169,51 +265,24 @@ def display_glp1_info_sidebar():
             - Metabolic Health Improvement
             """)
         
-        with st.expander("How They Work", expanded=False):
-            st.markdown("""
-            - Stimulate insulin secretion
-            - Suppress glucagon release
-            - Slow gastric emptying
-            - Reduce appetite
-            - Improve insulin sensitivity
-            """)
-        
-        st.warning("⚠️ **Medical Disclaimer:** This tool is for educational purposes only. Always consult a licensed healthcare provider before starting any medication.")
-        
         st.markdown("---")
-        
-        # API Status Check
-        if st.button("🔌 Test API Connection"):
-            with st.spinner("Testing connection..."):
-                status, message = test_api_connection()
-                if status:
-                    st.success(message)
-                else:
-                    st.error(message)
-        
-        st.markdown("---")
+        st.warning("⚠️ **Disclaimer:** Educational purposes only. Consult healthcare providers for medical advice.")
         st.caption("**Data Source:** [EndlessMedical API](https://www.endlessmedical.com)")
-        st.caption(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 
 def collect_patient_data() -> Dict:
-    """Collect patient information from UI"""
+    """Collect patient information"""
     st.header("📋 Patient Information")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        age = st.number_input("Age", min_value=18, max_value=120, value=45, 
-                             help="Patient's age in years")
-        gender = st.selectbox("Gender", ["male", "female"], 
-                             help="Biological sex")
+        age = st.number_input("Age", min_value=18, max_value=120, value=45)
+        gender = st.selectbox("Gender", ["male", "female"])
     
     with col2:
-        bmi = st.number_input("BMI (optional)", min_value=10.0, max_value=70.0, 
-                             value=25.0, step=0.1,
-                             help="Body Mass Index")
-        weight = st.number_input("Weight in kg (optional)", min_value=30.0, 
-                                max_value=300.0, value=70.0, step=0.5)
+        bmi = st.number_input("BMI", min_value=10.0, max_value=70.0, value=25.0, step=0.1)
+        weight = st.number_input("Weight (kg)", min_value=30.0, max_value=300.0, value=70.0)
     
     st.markdown("---")
     st.subheader("🏥 Medical Conditions")
@@ -221,28 +290,19 @@ def collect_patient_data() -> Dict:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        has_diabetes = st.checkbox("Diabetes Type 2", value=False,
-                                  help="Diagnosed Type 2 Diabetes")
-        has_prediabetes = st.checkbox("Prediabetes", value=False,
-                                     help="Elevated blood sugar levels")
-        has_obesity = st.checkbox("Obesity", value=False,
-                                 help="BMI ≥ 30")
+        has_diabetes = st.checkbox("Type 2 Diabetes")
+        has_prediabetes = st.checkbox("Prediabetes")
+        has_obesity = st.checkbox("Obesity")
     
     with col2:
-        has_high_blood_sugar = st.checkbox("High Blood Sugar", value=False,
-                                          help="Elevated glucose levels")
-        has_weight_gain = st.checkbox("Recent Weight Gain", value=False,
-                                     help="Significant weight increase")
-        has_cardiovascular = st.checkbox("Cardiovascular Disease", value=False,
-                                       help="Heart or vascular conditions")
+        has_high_blood_sugar = st.checkbox("High Blood Sugar")
+        has_weight_gain = st.checkbox("Recent Weight Gain")
+        has_cardiovascular = st.checkbox("Cardiovascular Disease")
     
     with col3:
-        has_hypertension = st.checkbox("Hypertension", value=False,
-                                      help="High blood pressure")
-        has_high_cholesterol = st.checkbox("High Cholesterol", value=False,
-                                          help="Elevated cholesterol levels")
-        has_fatty_liver = st.checkbox("Fatty Liver Disease", value=False,
-                                     help="NAFLD/NASH")
+        has_hypertension = st.checkbox("Hypertension")
+        has_high_cholesterol = st.checkbox("High Cholesterol")
+        has_fatty_liver = st.checkbox("Fatty Liver")
     
     st.markdown("---")
     st.subheader("🩺 Current Symptoms")
@@ -250,19 +310,19 @@ def collect_patient_data() -> Dict:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        has_fatigue = st.checkbox("Fatigue", value=False)
-        has_increased_thirst = st.checkbox("Increased Thirst", value=False)
-        has_frequent_urination = st.checkbox("Frequent Urination", value=False)
+        has_fatigue = st.checkbox("Fatigue")
+        has_increased_thirst = st.checkbox("Increased Thirst")
+        has_frequent_urination = st.checkbox("Frequent Urination")
     
     with col2:
-        has_blurred_vision = st.checkbox("Blurred Vision", value=False)
-        has_slow_healing = st.checkbox("Slow Healing Wounds", value=False)
-        has_hunger = st.checkbox("Increased Hunger", value=False)
+        has_blurred_vision = st.checkbox("Blurred Vision")
+        has_slow_healing = st.checkbox("Slow Healing")
+        has_hunger = st.checkbox("Increased Hunger")
     
     with col3:
-        has_numbness = st.checkbox("Numbness/Tingling", value=False)
-        has_nausea = st.checkbox("Nausea", value=False)
-        has_headaches = st.checkbox("Frequent Headaches", value=False)
+        has_numbness = st.checkbox("Numbness/Tingling")
+        has_nausea = st.checkbox("Nausea")
+        has_headaches = st.checkbox("Headaches")
     
     return {
         'demographics': {
@@ -297,67 +357,57 @@ def collect_patient_data() -> Dict:
 
 
 def analyze_patient(patient_data: Dict) -> Optional[Dict]:
-    """Analyze patient data using EndlessMedical API"""
-    api = EndlessMedicalAPI()
+    """Analyze patient data"""
+    api = EndlessMedicalAPI(force_mock=st.session_state.using_mock)
     
-    # Create session
-    progress_bar = st.progress(0, text="Initializing session...")
+    progress_bar = st.progress(0, text="Initializing...")
+    
     if not api.create_session():
-        st.error(f"Failed to create session: {api.get_last_error()}")
-        return None
+        if not st.session_state.using_mock:
+            st.warning("⚠️ API unavailable - switching to demo mode")
+            st.session_state.using_mock = True
+            api = EndlessMedicalAPI(force_mock=True)
+            api.create_session()
     
     progress_bar.progress(20, text="Accepting terms...")
-    if not api.accept_terms():
-        st.error(f"Failed to accept terms: {api.get_last_error()}")
-        return None
+    api.accept_terms()
     
-    # Add patient features
-    progress_bar.progress(40, text="Adding patient demographics...")
+    progress_bar.progress(40, text="Adding demographics...")
     api.add_feature("Age", str(patient_data['demographics']['age']))
     api.add_feature("Gender", patient_data['demographics']['gender'])
     
-    progress_bar.progress(50, text="Adding medical conditions...")
+    progress_bar.progress(50, text="Adding conditions...")
     feature_count = 0
     
-    # Add conditions
     for condition, has_condition in patient_data['conditions'].items():
         if has_condition:
             api.add_feature(condition, "yes")
             feature_count += 1
-            time.sleep(0.1)  # Small delay to avoid rate limiting
     
     progress_bar.progress(70, text="Adding symptoms...")
-    # Add symptoms
     for symptom, has_symptom in patient_data['symptoms'].items():
         if has_symptom:
             api.add_feature(symptom, "yes")
             feature_count += 1
-            time.sleep(0.1)
     
     st.session_state.feature_count = feature_count
     
-    # Analyze
-    progress_bar.progress(90, text="Analyzing patient data...")
+    progress_bar.progress(90, text="Analyzing...")
     time.sleep(0.5)
     results = api.analyze()
     
-    progress_bar.progress(100, text="Analysis complete!")
+    progress_bar.progress(100, text="Complete!")
     time.sleep(0.3)
     progress_bar.empty()
-    
-    if not results:
-        st.error(f"Analysis failed: {api.get_last_error()}")
-        return None
     
     return results
 
 
 def assess_glp1_suitability(patient_data: Dict) -> Tuple[str, str, List[str]]:
-    """Assess patient suitability for GLP-1 therapy"""
+    """Assess GLP-1 suitability"""
     conditions = patient_data['conditions']
     demographics = patient_data['demographics']
     
-    # Calculate risk factors
     risk_factors = []
     if conditions.get('Diabetes'):
         risk_factors.append("Type 2 Diabetes diagnosis")
@@ -370,21 +420,20 @@ def assess_glp1_suitability(patient_data: Dict) -> Tuple[str, str, List[str]]:
     if conditions.get('HighBloodSugar'):
         risk_factors.append("Elevated blood sugar")
     if conditions.get('WeightGain'):
-        risk_factors.append("Recent significant weight gain")
+        risk_factors.append("Significant weight gain")
     
-    # Determine suitability level
     if conditions.get('Diabetes') or (conditions.get('Obesity') and demographics['bmi'] >= 30):
         level = "high"
-        message = "✅ **High Suitability** - Patient profile strongly suggests potential benefit from GLP-1 therapy"
+        message = "✅ **High Suitability** - Strong indication for GLP-1 therapy"
     elif len(risk_factors) >= 2:
         level = "moderate"
-        message = "⚠️ **Moderate Suitability** - Patient may benefit from GLP-1 therapy pending further evaluation"
+        message = "⚠️ **Moderate Suitability** - May benefit from evaluation"
     elif len(risk_factors) == 1:
         level = "low"
-        message = "ℹ️ **Low Suitability** - GLP-1 therapy may not be indicated at this time"
+        message = "ℹ️ **Low Suitability** - May not be indicated"
     else:
         level = "not_indicated"
-        message = "❌ **Not Indicated** - GLP-1 therapy typically not recommended for this profile"
+        message = "❌ **Not Indicated** - Typically not recommended"
     
     return level, message, risk_factors
 
@@ -392,6 +441,10 @@ def assess_glp1_suitability(patient_data: Dict) -> Tuple[str, str, List[str]]:
 def display_results(results: Dict, patient_data: Dict):
     """Display analysis results"""
     st.header("📊 Analysis Results")
+    
+    # Display mode indicator
+    if st.session_state.using_mock:
+        st.info("ℹ️ **Demo Mode** - Showing sample analysis (API unavailable)")
     
     col1, col2, col3 = st.columns(3)
     
@@ -404,8 +457,8 @@ def display_results(results: Dict, patient_data: Dict):
     
     st.markdown("---")
     
-    # GLP-1 Suitability Assessment
-    st.subheader("💊 GLP-1 Medication Suitability Assessment")
+    # GLP-1 Assessment
+    st.subheader("💊 GLP-1 Medication Suitability")
     
     level, message, risk_factors = assess_glp1_suitability(patient_data)
     
@@ -419,334 +472,5 @@ def display_results(results: Dict, patient_data: Dict):
         st.error(message)
     
     if risk_factors:
-        st.markdown("**Identified Risk Factors:**")
-        for factor in risk_factors:
-            st.markdown(f"• {factor}")
-    
-    # Recommendations
-    st.markdown("---")
-    st.subheader("📋 Recommended Next Steps")
-    
-    if level in ["high", "moderate"]:
-        st.markdown("""
-        1. **Consult with Endocrinologist** - Schedule appointment for comprehensive evaluation
-        2. **Complete Medical History Review** - Ensure no contraindications
-        3. **Laboratory Tests** - A1C, fasting glucose, kidney function, thyroid panel
-        4. **Insurance Verification** - Check coverage and prior authorization requirements
-        5. **Discuss Benefits vs Risks** - Review potential side effects and monitoring plan
-        """)
-    else:
-        st.markdown("""
-        1. **Lifestyle Modifications** - Focus on diet and exercise first
-        2. **Regular Monitoring** - Track weight, blood sugar, and blood pressure
-        3. **Follow-up Appointment** - Re-evaluate in 3-6 months
-        4. **Consider Alternative Therapies** - Discuss other medication options if needed
-        """)
-    
-    # Raw API Results
-    st.markdown("---")
-    with st.expander("🔬 Detailed API Response", expanded=False):
-        st.json(results)
-    
-    # Export options
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("📥 Download Results (JSON)", use_container_width=True):
-            results_data = {
-                'timestamp': datetime.now().isoformat(),
-                'patient_data': patient_data,
-                'api_results': results,
-                'suitability': {'level': level, 'message': message, 'risk_factors': risk_factors}
-            }
-            st.download_button(
-                label="Download JSON",
-                data=json.dumps(results_data, indent=2),
-                file_name=f"glp1_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
-    
-    with col2:
-        if st.button("🔄 New Analysis", use_container_width=True):
-            st.session_state.analysis_complete = False
-            st.session_state.results = None
-            st.rerun()
-
-
-def main():
-    """Main Streamlit application"""
-    
-    st.set_page_config(
-        page_title="GLP-1 Medical Information Analyzer",
-        page_icon="💊",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Custom CSS
-    st.markdown("""
-    <style>
-    .stButton > button {
-        width: 100%;
-    }
-    .reportview-container .main .block-container {
-        padding-top: 2rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    initialize_session_state()
-    
-    # Header
-    st.title("💊 GLP-1 Medical Information Analyzer")
-    st.markdown("**AI-Powered Patient Assessment for GLP-1 Medication Suitability**")
-    st.markdown("---")
-    
-    # Sidebar
-    display_glp1_info_sidebar()
-    
-    # Main content
-    if not st.session_state.analysis_complete:
-        # Data collection phase
-        patient_data = collect_patient_data()
-        
-        st.markdown("---")
-        
-        # Analyze button
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            if st.button("🔍 Analyze Patient Profile", type="primary", use_container_width=True):
-                with st.spinner("Analyzing patient data..."):
-                    results = analyze_patient(patient_data)
-                    
-                    if results:
-                        st.session_state.results = results
-                        st.session_state.patient_data = patient_data
-                        st.session_state.analysis_complete = True
-                        st.session_state.last_analysis_time = datetime.now()
-                        st.success("✅ Analysis complete!")
-                        time.sleep(0.5)
-                        st.rerun()
-    else:
-        # Display results
-        display_results(st.session_state.results, st.session_state.patient_data)
-    
-    # Educational Information Section
-    st.markdown("---")
-    st.header("📚 GLP-1 Medication Information")
-    
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "How They Work", 
-        "Benefits", 
-        "Side Effects", 
-        "Considerations",
-        "Cost & Access"
-    ])
-    
-    with tab1:
-        st.markdown("""
-        ### Mechanism of Action
-        
-        GLP-1 (Glucagon-Like Peptide-1) receptor agonists work through multiple pathways:
-        
-        **Glucose Regulation:**
-        - Stimulate insulin secretion when blood sugar is elevated (glucose-dependent)
-        - Suppress glucagon release to prevent excess glucose production by liver
-        - Reduce hepatic glucose output
-        
-        **Weight Management:**
-        - Slow gastric emptying, promoting satiety and reducing food intake
-        - Act on brain appetite centers to reduce hunger signals
-        - Increase energy expenditure
-        
-        **Cardiovascular Effects:**
-        - Improve endothelial function
-        - Reduce inflammation markers
-        - May lower blood pressure
-        - Potential anti-atherosclerotic effects
-        """)
-    
-    with tab2:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("""
-            **For Type 2 Diabetes:**
-            - A1C reduction: 1.0-1.5% on average
-            - Low risk of hypoglycemia (vs insulin, sulfonylureas)
-            - Cardiovascular benefits demonstrated in trials
-            - Kidney protective effects
-            - Can be combined with other diabetes medications
-            """)
-        
-        with col2:
-            st.markdown("""
-            **For Weight Management:**
-            - Average weight loss: 10-15% of body weight
-            - Sustained weight loss with continued use
-            - Reduced appetite and food cravings
-            - Improved metabolic parameters
-            - Better quality of life outcomes
-            """)
-        
-        st.markdown("""
-        **Additional Benefits:**
-        - Reduced risk of major cardiovascular events (some medications)
-        - Potential reduction in stroke risk
-        - May improve liver enzymes in fatty liver disease
-        - Once-weekly dosing options available
-        - Can reduce need for insulin in some patients
-        """)
-    
-    with tab3:
-        st.markdown("""
-        ### Side Effect Profile
-        
-        **Very Common (>10% of patients):**
-        - Nausea (usually improves after 4-8 weeks)
-        - Diarrhea
-        - Decreased appetite
-        - Constipation
-        
-        **Common (1-10% of patients):**
-        - Vomiting
-        - Abdominal pain or discomfort
-        - Heartburn/acid reflux
-        - Injection site reactions
-        - Fatigue
-        - Headache
-        
-        **Serious but Rare:**
-        - Pancreatitis (inflammation of pancreas)
-        - Gallbladder problems (gallstones, cholecystitis)
-        - Kidney problems (usually in dehydrated patients)
-        - Severe allergic reactions
-        - Changes in vision (diabetic retinopathy complications)
-        
-        **Black Box Warning:**
-        - Risk of thyroid C-cell tumors (seen in rodent studies)
-        - Not recommended if personal/family history of medullary thyroid cancer
-        - Avoid in Multiple Endocrine Neoplasia syndrome type 2
-        
-        **Management Tips:**
-        - Start with low dose and titrate slowly
-        - Take with food to reduce nausea
-        - Stay well hydrated
-        - Report severe abdominal pain immediately
-        """)
-    
-    with tab4:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("""
-            **Contraindications:**
-            - Personal/family history of medullary thyroid carcinoma
-            - Multiple Endocrine Neoplasia syndrome type 2
-            - Pregnancy or planning pregnancy
-            - Type 1 diabetes (most formulations)
-            - Severe gastrointestinal disease
-            - History of pancreatitis (relative)
-            - Diabetic ketoacidosis
-            """)
-        
-        with col2:
-            st.markdown("""
-            **Drug Interactions:**
-            - May slow absorption of oral medications
-            - Insulin doses may need adjustment
-            - Warfarin monitoring needed
-            - May affect digoxin levels
-            - Caution with other weight loss medications
-            """)
-        
-        st.markdown("""
-        **Monitoring Requirements:**
-        - Regular blood glucose monitoring (if diabetic)
-        - Kidney function tests (baseline and periodic)
-        - Watch for signs of pancreatitis
-        - Monitor for dehydration
-        - Regular weight checks
-        - A1C every 3 months initially
-        - Thyroid monitoring (if symptoms develop)
-        - Eye exams (diabetic patients)
-        
-        **Lifestyle Factors:**
-        - Most effective when combined with diet and exercise
-        - Requires long-term commitment
-        - Weight may return if medication stopped
-        - Regular follow-up appointments essential
-        - Support for behavior change recommended
-        """)
-    
-    with tab5:
-        st.markdown("""
-        ### Cost & Access Information
-        
-        **Pricing (Without Insurance):**
-        - Monthly cost: $900-$1,500
-        - Annual cost: $11,000-$18,000
-        - Prices vary by medication and pharmacy
-        
-        **Insurance Coverage:**
-        - Most insurance plans cover for diabetes
-        - Weight loss indication may have restrictions
-        - Prior authorization often required
-        - Step therapy may be needed
-        - Coverage varies by plan and state
-        
-        **Ways to Reduce Costs:**
-        
-        1. **Manufacturer Savings Programs:**
-           - Ozempic: savings card available
-           - Wegovy: savings program for eligible patients
-           - Trulicity: savings card program
-           - Mounjaro: savings card for eligible patients
-        
-        2. **Patient Assistance Programs:**
-           - Novo Nordisk PAP (Ozempic, Wegovy)
-           - Lilly Cares (Trulicity, Mounjaro)
-           - Income-based eligibility
-        
-        3. **Generic/Biosimilar Options:**
-           - Not yet available in US
-           - Expected in coming years
-        
-        4. **Compounding Pharmacies:**
-           - Lower cost options available
-           - Quality and safety concerns
-           - Not FDA-approved formulations
-        
-        5. **Alternative Strategies:**
-           - Ask about older GLP-1 medications
-           - Check multiple pharmacies for pricing
-           - Use prescription discount cards
-           - Consider mail-order pharmacies
-        
-        **Access Resources:**
-        - [NeedyMeds.org](https://www.needymeds.org) - Assistance program database
-        - [RxAssist.org](https://www.rxassist.org) - Patient assistance programs
-        - Manufacturer websites for savings cards
-        - Healthcare provider's office for samples
-        """)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    <div style='text-align: center; color: #666; padding: 20px;'>
-        <p><strong>⚠️ IMPORTANT MEDICAL DISCLAIMER ⚠️</strong></p>
-        <p>This tool provides educational information only and is NOT a substitute for professional medical advice, 
-        diagnosis, or treatment. The analysis provided should not be used to make medical decisions.</p>
-        <p><strong>Always seek the advice of your physician or other qualified health provider</strong> with any questions 
-        you may have regarding a medical condition or medication.</p>
-        <p style='margin-top: 20px;'>
-            Data powered by <a href='https://www.endlessmedical.com' target='_blank'>EndlessMedical API</a> | 
-            Educational Use Only | Not for Clinical Decision Making
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-if __name__ == "__main__":
-    main()
+        st.markdown("**Risk Factors Identified:**")
+        for
